@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dendrite</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <style>
+        /* Application-wide Base Styles */
+        :root {
+            --row-height: 36px;
+            --grid-border-color: #e5e7eb;
+        }
+        
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+
+        /* Scrollbar Polish */
+        ::-webkit-scrollbar { width: 12px; height: 12px; }
+        ::-webkit-scrollbar-track { background: #f8fafc; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 6px; border: 3px solid #f8fafc; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        input:focus, select:focus { outline: none; }
+
+        /* THE MAGIC: Grid & Subgrid Setup */
+        .outliner-grid {
+            display: grid;
+            width: 100%;
+            overflow: auto;
+            position: relative;
+        }
+
+        /* The Row Component Host */
+        outline-row {
+            display: grid;
+            grid-column: 1 / -1; /* Span all columns */
+            grid-template-columns: subgrid; /* Align children to parent tracks */
+            border-bottom: 1px solid var(--grid-border-color);
+        }
+
+        /* Sticky Mechanics */
+        .sticky-top { position: sticky; top: 0; z-index: 20; }
+        .sticky-left { position: sticky; left: 0; z-index: 10; }
+        .sticky-corner { position: sticky; top: 0; left: 0; z-index: 30; } /* Top Left Intersection */
+
+        /* Visuals */
+        .cell {
+            display: flex;
+            align-items: center;
+            padding: 0 8px;
+            height: var(--row-height);
+            border-right: 1px solid var(--grid-border-color);
+            background-color: white;
+        }
+        
+        .header-cell {
+            background-color: #f3f4f6;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #6b7280;
+            border-bottom: 1px solid #d1d5db;
+            border-right: 1px solid #d1d5db;
+            display: flex;
+            align-items: center;
+            height: 40px;
+            padding: 0 8px; 
+        }
+
+        /* Row Hover Effect */
+        outline-row:hover .cell { background-color: #f9fafb; }
+        outline-row:hover .sticky-left { background-color: #f9fafb; }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-900 h-screen flex flex-col overflow-hidden">
+
+    <div id="app-root" class="h-full w-full flex flex-col"></div>
+
+    <script type="module">
+        import { LitElement, html, render, nothing } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js';
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+        const generateId = () => Math.random().toString(36).substr(2, 9);
+        const debounce = (func, wait) => {
+            let timeout;
+            return function(...args) {
+                const later = () => { clearTimeout(timeout); func.apply(this, args); };
+                clearTimeout(timeout);
+                timeout = setTimeout(later, wait);
+            };
+        };
+
+        /**
+         * Outline Row
+         */
+        class OutlineRow extends LitElement {
+            static properties = {
+                row: { type: Object },
+                columns: { type: Array },
+                level: { type: Number },
+                hasChildren: { type: Boolean },
+                index: { type: Number }
+            };
+
+            createRenderRoot() { return this; }
+
+            constructor() {
+                super();
+                this.debouncedUpdate = debounce(this.updateRowData.bind(this), 500);
+            }
+
+            handleInput(field, e) {
+                // We infer label based on field
+                this.debouncedUpdate(field, e.target.value);
+            }
+
+            updateRowData(field, value) {
+                const label = field === 'content' ? 'Typing' : `Update ${field}`;
+                this.dispatchEvent(new CustomEvent('row-update', {
+                    detail: { id: this.row.id, data: { [field]: value }, label }
+                }));
+            }
+
+            handleKeyDown(e) {
+                if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+                    e.preventDefault();
+                    this.dispatchEvent(new CustomEvent('trigger-history', {
+                        detail: { type: e.shiftKey ? 'redo' : 'undo' }
+                    }));
+                    return;
+                }
+
+                if (['Enter', 'ArrowUp', 'ArrowDown', 'Tab', 'Backspace'].includes(e.key)) {
+                    this.dispatchEvent(new CustomEvent('row-action', {
+                        detail: { 
+                            type: e.key, 
+                            id: this.row.id, 
+                            shiftKey: e.shiftKey,
+                            selectionStart: e.target.selectionStart,
+                            value: e.target.value
+                        }
+                    }));
+                    if (e.key === 'Tab' || e.key === 'Enter') e.preventDefault();
+                }
+            }
+
+            toggleExpand() {
+                this.dispatchEvent(new CustomEvent('row-update', {
+                    detail: { id: this.row.id, data: { isExpanded: !this.row.isExpanded }, label: 'Toggle Expand' }
+                }));
+            }
+
+            renderCell(col) {
+                const val = this.row[col.id];
+                if (col.type === 'select') {
+                    return html`
+                        <div class="cell">
+                            <select 
+                                .value="${val || 'planned'}"
+                                @change="${(e) => this.updateRowData(col.id, e.target.value)}"
+                                class="w-full bg-transparent text-xs font-bold text-gray-500 cursor-pointer hover:text-blue-600 appearance-none"
+                            >
+                                <option value="planned">Planned</option>
+                                <option value="wip">In Progress</option>
+                                <option value="done">Done</option>
+                                <option value="blocked">Blocked</option>
+                            </select>
+                        </div>
+                    `;
+                }
+                return html`
+                    <div class="cell">
+                        <input 
+                            type="text" 
+                            .value="${val || ''}"
+                            @input="${(e) => this.handleInput(col.id, e)}"
+                            @keydown="${this.handleKeyDown}"
+                            class="w-full bg-transparent text-sm text-gray-700 placeholder-gray-200"
+                            placeholder="..."
+                        >
+                    </div>
+                `;
+            }
+
+            render() {
+                const paddingLeft = (this.level * 24) + 12;
+
+                return html`
+                    <!-- Topic Cell (Sticky Left) -->
+                    <div class="cell sticky-left" style="padding-left: ${paddingLeft}px;">
+                        <div class="w-5 h-5 flex items-center justify-center mr-1 cursor-pointer text-gray-400 hover:text-gray-700 select-none flex-shrink-0"
+                             @click="${this.toggleExpand}">
+                            ${this.hasChildren 
+                                ? (this.row.isExpanded ? '▼' : '▶') 
+                                : html`<div class="w-1.5 h-1.5 rounded-full bg-gray-300"></div>`}
+                        </div>
+
+                        <input 
+                            type="text" 
+                            .value="${this.row.content || ''}" 
+                            @input="${(e) => this.handleInput('content', e)}"
+                            @keydown="${this.handleKeyDown}"
+                            class="flex-grow bg-transparent font-medium text-gray-900 placeholder-gray-300 min-w-0"
+                            placeholder="New Item"
+                            id="input-${this.row.id}"
+                        >
+                    </div>
+
+                    ${this.columns.map(col => this.renderCell(col))}
+                    <div class="cell border-none"></div> 
+                `;
+            }
+        }
+        customElements.define('outline-row', OutlineRow);
+
+
+        class OutlinerApp extends LitElement {
+            static properties = {
+                rows: { type: Array },
+                columns: { type: Array },
+                userId: { type: String },
+                loading: { type: Boolean },
+                statusMsg: { type: String },
+                isAddingColumn: { type: Boolean },
+                newColName: { type: String },
+                historyStack: { type: Array },
+                historyIndex: { type: Number },
+                isHistoryOpen: { type: Boolean }
+            };
+
+            createRenderRoot() { return this; }
+
+            constructor() {
+                super();
+                this.rows = [];
+                this.columns = [];
+                this.loading = true;
+                this.statusMsg = "Connecting...";
+                this.isAddingColumn = false;
+                this.newColName = "";
+                
+                this.historyStack = [];
+                this.historyIndex = -1;
+                this.isHistoryOpen = false;
+            }
+
+            updated(changedProps) {
+                if (changedProps.has('isAddingColumn') && this.isAddingColumn) {
+                    setTimeout(() => {
+                        const input = this.querySelector('#new-col-input');
+                        if (input) input.focus();
+                    }, 50);
+                }
+            }
+
+            async connectedCallback() {
+                super.connectedCallback();
+                window.addEventListener('keydown', this.handleGlobalKeydown.bind(this));
+                window.addEventListener('click', this.handleOutsideClick.bind(this));
+
+                const initAuth = async () => {
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(auth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (err) {
+                        console.error(err);
+                        this.statusMsg = "Auth Error";
+                    }
+                };
+                await initAuth();
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        this.userId = user.uid;
+                        this.statusMsg = "Syncing";
+                        this.initData();
+                    }
+                });
+            }
+
+            disconnectedCallback() {
+                super.disconnectedCallback();
+                window.removeEventListener('keydown', this.handleGlobalKeydown.bind(this));
+                window.removeEventListener('click', this.handleOutsideClick.bind(this));
+            }
+            
+            handleOutsideClick(e) {
+                if (this.isHistoryOpen && !e.target.closest('.history-dropdown')) {
+                    this.isHistoryOpen = false;
+                }
+            }
+
+            initData() {
+                const rowsRef = collection(db, 'artifacts', appId, 'public', 'data', 'outline_rows');
+                const colsRef = collection(db, 'artifacts', appId, 'public', 'data', 'outline_columns');
+
+                onSnapshot(rowsRef, (snap) => {
+                    const list = [];
+                    snap.forEach(d => list.push({...d.data(), id: d.id}));
+                    list.sort((a,b) => (a.rank || 0) - (b.rank || 0));
+                    this.rows = list;
+                    if (this.loading) {
+                        this.loading = false;
+                        this.statusMsg = "Saved";
+                    }
+                });
+
+                onSnapshot(colsRef, (snap) => {
+                    const list = [];
+                    snap.forEach(d => list.push({...d.data(), id: d.id}));
+                    list.sort((a,b) => a.order - b.order);
+                    if (list.length === 0) this.seedDefaults();
+                    else this.columns = list;
+                });
+            }
+
+            async seedDefaults() {
+                const batch = writeBatch(db);
+                const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'outline_columns');
+                batch.set(doc(colRef, 'status'), { label: 'Status', type: 'select', order: 0 });
+                batch.set(doc(colRef, 'note'), { label: 'Notes', type: 'text', order: 1 });
+                await batch.commit();
+            }
+
+            getRenderList() {
+                const map = {};
+                const roots = [];
+                this.rows.forEach(r => map[r.id] = {...r, children: []});
+                this.rows.forEach(r => {
+                    if(r.parentId && map[r.parentId]) map[r.parentId].children.push(map[r.id]);
+                    else roots.push(map[r.id]);
+                });
+                
+                const flat = [];
+                const traverse = (nodes, level) => {
+                    nodes.sort((a,b) => a.rank - b.rank);
+                    nodes.forEach(n => {
+                        flat.push({...n, level, hasChildren: n.children.length > 0});
+                        if (n.isExpanded !== false && n.children.length > 0) traverse(n.children, level + 1);
+                    });
+                };
+                traverse(roots, 0);
+                return flat;
+            }
+
+            // --- HISTORY SYSTEM ---
+
+            recordHistory(undoFn, redoFn, label = 'Action') {
+                if (this.historyIndex < this.historyStack.length - 1) {
+                    this.historyStack = this.historyStack.slice(0, this.historyIndex + 1);
+                }
+                this.historyStack.push({ undo: undoFn, redo: redoFn, label, timestamp: Date.now() });
+                this.historyIndex++;
+                
+                if (this.historyStack.length > 50) {
+                    this.historyStack.shift();
+                    this.historyIndex--;
+                }
+                this.requestUpdate(); // Force UI update for dropdown
+            }
+
+            async performUndo() {
+                if (this.historyIndex >= 0) {
+                    const action = this.historyStack[this.historyIndex];
+                    this.historyIndex--;
+                    this.statusMsg = `Undoing ${action.label}...`;
+                    await action.undo();
+                    setTimeout(() => this.statusMsg = "Ready", 500);
+                }
+            }
+
+            async performRedo() {
+                if (this.historyIndex < this.historyStack.length - 1) {
+                    this.historyIndex++;
+                    const action = this.historyStack[this.historyIndex];
+                    this.statusMsg = `Redoing ${action.label}...`;
+                    await action.redo();
+                    setTimeout(() => this.statusMsg = "Ready", 500);
+                }
+            }
+
+            handleGlobalKeydown(e) {
+                if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+                    e.preventDefault();
+                    if (e.shiftKey) this.performRedo();
+                    else this.performUndo();
+                }
+            }
+
+            // --- WRAPPED ACTIONS ---
+
+            async updateRow(id, data, record = true, label = 'Update Row') {
+                if (record) {
+                    const currentRow = this.rows.find(r => r.id === id);
+                    if (currentRow) {
+                        const undoData = {};
+                        Object.keys(data).forEach(k => undoData[k] = currentRow[k]);
+                        this.recordHistory(
+                            () => this.updateRow(id, undoData, false),
+                            () => this.updateRow(id, data, false),
+                            label
+                        );
+                    }
+                }
+                this.statusMsg = "Saving...";
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'outline_rows', id), data, {merge:true});
+            }
+
+            async createRow(id, data, label = 'Create Row') {
+                const doCreate = async () => setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'outline_rows', id), data);
+                const undoCreate = async () => deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'outline_rows', id));
+                this.recordHistory(undoCreate, doCreate, label);
+                this.statusMsg = "Creating...";
+                await doCreate();
+            }
+
+            async deleteRow(id, label = 'Delete Row') {
+                const rowToDelete = this.rows.find(r => r.id === id);
+                if (!rowToDelete) return;
+                const doDelete = async () => deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'outline_rows', id));
+                const undoDelete = async () => setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'outline_rows', id), rowToDelete);
+                this.recordHistory(undoDelete, doDelete, label);
+                this.statusMsg = "Deleting...";
+                await doDelete();
+            }
+
+
+            async submitNewColumn() {
+                if(!this.newColName.trim()) return;
+                const id = generateId();
+                const order = this.columns.length;
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'outline_columns', id), {
+                    label: this.newColName, type: 'text', order
+                });
+                this.isAddingColumn = false;
+                this.newColName = "";
+            }
+
+            async deleteColumn(id) {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'outline_columns', id));
+            }
+
+            async handleRowAction(e) {
+                const { type, id, shiftKey, value } = e.detail;
+                const list = this.getRenderList();
+                const idx = list.findIndex(r => r.id === id);
+                const row = list[idx];
+                
+                if (type === 'Enter') {
+                    const newId = generateId();
+                    const newData = { content: '', parentId: row.parentId, rank: (row.rank||0)+100, isExpanded: true };
+                    await this.createRow(newId, newData, "New Line");
+                    setTimeout(() => this.focusRow(newId), 50);
+                
+                } else if (type === 'ArrowUp' && idx > 0) {
+                    this.focusRow(list[idx-1].id);
+                
+                } else if (type === 'ArrowDown' && idx < list.length - 1) {
+                    this.focusRow(list[idx+1].id);
+                
+                } else if (type === 'Backspace' && value === '') {
+                    if (idx > 0) this.focusRow(list[idx-1].id);
+                    await this.deleteRow(id, "Delete Line");
+                
+                } else if (type === 'Tab') {
+                    if (!shiftKey) {
+                        if (idx === 0) return; 
+                        let newParentCandidate = null;
+                        for (let i = idx - 1; i >= 0; i--) {
+                             if (list[i].level === row.level) { newParentCandidate = list[i]; break; }
+                             if (list[i].level < row.level) break; 
+                        }
+                        if (newParentCandidate) {
+                             await this.updateRow(newParentCandidate.id, { isExpanded: true }, true, 'Expand Parent');
+                             const siblings = this.rows.filter(r => r.parentId === newParentCandidate.id);
+                             const maxRank = siblings.length > 0 ? Math.max(...siblings.map(r => r.rank || 0)) : 0;
+                             await this.updateRow(id, { parentId: newParentCandidate.id, rank: maxRank + 100 }, true, 'Indent Row');
+                        }
+                    } else if (shiftKey && row.parentId) {
+                        const currentParent = this.rows.find(r => r.id === row.parentId);
+                        if (!currentParent) return;
+                        const parentPeers = this.rows.filter(r => r.parentId === currentParent.parentId);
+                        parentPeers.sort((a, b) => (a.rank || 0) - (b.rank || 0));
+                        const parentIdx = parentPeers.findIndex(r => r.id === currentParent.id);
+                        let newRank;
+                        if (parentIdx < parentPeers.length - 1) {
+                            const nextPeer = parentPeers[parentIdx + 1];
+                            newRank = ((currentParent.rank || 0) + (nextPeer.rank || 0)) / 2;
+                        } else {
+                            newRank = (currentParent.rank || 0) + 100;
+                        }
+                        await this.updateRow(id, { parentId: currentParent.parentId, rank: newRank }, true, 'Outdent Row');
+                    }
+                }
+            }
+
+            focusRow(id) {
+                const el = document.getElementById(`input-${id}`);
+                if(el) el.focus();
+            }
+
+            async addRootRow() {
+                const id = generateId();
+                const newData = { content: 'New Topic', parentId: null, rank: Date.now(), isExpanded: true };
+                await this.createRow(id, newData, "New Topic");
+            }
+
+            render() {
+                const list = this.getRenderList();
+                const colTemplate = `minmax(350px, 1fr) repeat(${this.columns.length}, 180px) 50px`;
+                const undoDisabled = this.historyIndex < 0;
+                const redoDisabled = this.historyIndex >= this.historyStack.length - 1;
+
+                return html`
+                    <div class="h-12 bg-white border-b border-gray-200 flex items-center px-4 justify-between flex-shrink-0 z-50 relative shadow-sm">
+                        <!-- Left: Logo -->
+                        <div class="flex items-center space-x-2">
+                            <div class="w-6 h-6 bg-indigo-600 rounded text-white flex items-center justify-center text-xs font-bold">D</div>
+                            <span class="font-semibold text-gray-700">Dendrite <span class="text-gray-400 font-normal text-xs ml-2">v0.0.1</span></span>
+                        </div>
+
+                        <!-- Center: Toolbar (Undo/Redo) -->
+                        <div class="absolute left-1/2 transform -translate-x-1/2 history-dropdown z-50">
+                            <span class="relative z-0 inline-flex shadow-sm rounded-md">
+                                <button type="button" 
+                                    class="relative inline-flex items-center px-2 py-1.5 rounded-l-md border border-gray-300 bg-white text-xs font-medium text-gray-700 hover:bg-gray-50 focus:z-10 focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed" 
+                                    @click=${this.performUndo}
+                                    ?disabled=${undoDisabled}>
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="mr-1"><path d="M3 7v6h6"></path><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"></path></svg>
+                                    Undo
+                                </button>
+                                <button type="button" 
+                                    class="-ml-px relative inline-flex items-center px-2 py-1.5 border border-gray-300 bg-white text-xs font-medium text-gray-700 hover:bg-gray-50 focus:z-10 focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed" 
+                                    @click=${this.performRedo}
+                                    ?disabled=${redoDisabled}>
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="mr-1"><path d="M21 7v6h-6"></path><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3l3 2.7"></path></svg>
+                                    Redo
+                                </button>
+                                <button type="button" 
+                                    class="-ml-px relative inline-flex items-center px-1 py-1.5 rounded-r-md border border-gray-300 bg-white text-xs font-medium text-gray-500 hover:bg-gray-50 focus:z-10 focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500" 
+                                    @click=${(e) => { e.stopPropagation(); this.isHistoryOpen = !this.isHistoryOpen; }}>
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                                </button>
+                            </span>
+
+                            <!-- History Dropdown -->
+                            ${this.isHistoryOpen ? html`
+                                <div class="absolute top-full left-0 mt-1 w-64 bg-white rounded-md shadow-lg border border-gray-200 ring-1 ring-black ring-opacity-5 focus:outline-none z-50 overflow-hidden">
+                                    <div class="py-1 max-h-80 overflow-y-auto">
+                                        <div class="px-4 py-2 text-[10px] font-bold text-gray-400 uppercase tracking-wider border-b border-gray-100">History Stack</div>
+                                        
+                                        <!-- Future (Redoable) -->
+                                        ${this.historyStack.slice(this.historyIndex + 1).reverse().map(action => html`
+                                            <div class="px-4 py-2 text-xs text-gray-400 italic bg-gray-50 border-l-2 border-transparent">
+                                                ${action.label}
+                                            </div>
+                                        `)}
+
+                                        <!-- Active Indicator -->
+                                        <div class="px-2 py-1 flex items-center justify-center bg-indigo-50 border-y border-indigo-100">
+                                            <div class="w-1.5 h-1.5 rounded-full bg-indigo-500 mr-2"></div>
+                                            <span class="text-[10px] font-bold text-indigo-600">Current State</span>
+                                        </div>
+
+                                        <!-- Past (Undoable) -->
+                                        ${[...this.historyStack].slice(0, this.historyIndex + 1).reverse().map(action => html`
+                                            <div class="px-4 py-2 text-xs text-gray-700 border-l-2 border-transparent hover:bg-gray-50">
+                                                ${action.label}
+                                            </div>
+                                        `)}
+
+                                        ${this.historyStack.length === 0 ? html`<div class="px-4 py-3 text-xs text-gray-400 text-center italic">No history yet</div>` : nothing}
+                                    </div>
+                                </div>
+                            ` : nothing}
+                        </div>
+
+                        <!-- Right: Status -->
+                        <div class="text-xs font-mono text-gray-400 flex items-center space-x-2">
+                            <span>${this.statusMsg}</span>
+                        </div>
+                    </div>
+
+                    <!-- GRID CONTENT -->
+                    <div class="outliner-grid flex-grow bg-white" style="grid-template-columns: ${colTemplate};">
+                        <div class="header-cell sticky-corner pl-3 z-30 shadow-[2px_2px_5px_-2px_rgba(0,0,0,0.05)]" style="padding-left: 12px;">Topic</div>
+                        ${this.columns.map(col => html`
+                            <div class="header-cell sticky-top justify-between group">
+                                <span>${col.label}</span>
+                                <button @click="${() => this.deleteColumn(col.id)}" class="text-red-300 hover:text-red-600 opacity-0 group-hover:opacity-100 transition-opacity p-1">&times;</button>
+                            </div>
+                        `)}
+                        <div class="header-cell sticky-top justify-center cursor-pointer hover:bg-gray-200 transition-colors" 
+                             @click="${() => { this.isAddingColumn = true; this.newColName = ''; }}"><span class="text-lg leading-none">+</span></div>
+
+                        ${list.map((row, idx) => html`
+                            <outline-row 
+                                .row="${row}"
+                                .columns="${this.columns}"
+                                .level="${row.level}"
+                                .hasChildren="${row.hasChildren}"
+                                .index="${idx}"
+                                @row-update="${(e) => this.updateRow(e.detail.id, e.detail.data, true, e.detail.label)}"
+                                @row-action="${this.handleRowAction}"
+                                @trigger-history="${(e) => e.detail.type === 'undo' ? this.performUndo() : this.performRedo()}"
+                            ></outline-row>
+                        `)}
+
+                        ${list.length === 0 ? html`
+                             <div class="col-span-full py-20 flex justify-center">
+                                <button @click="${this.addRootRow}" class="px-4 py-2 bg-indigo-50 text-indigo-600 rounded hover:bg-indigo-100 font-medium text-sm">+ Add First Row</button>
+                             </div>
+                        ` : html`
+                            <div class="col-span-full h-64 cursor-text" @click="${() => this.addRootRow()}"></div>
+                        `}
+                    </div>
+
+                    ${this.isAddingColumn ? html`
+                        <div class="fixed inset-0 bg-black/20 z-[60] flex items-start pt-32 justify-center" @click="${() => this.isAddingColumn = false}">
+                             <div class="bg-white p-4 rounded-lg shadow-xl w-72 ring-1 ring-gray-200" @click="${e => e.stopPropagation()}">
+                                <h3 class="text-sm font-bold text-gray-700 mb-3">Add New Column</h3>
+                                <input id="new-col-input" type="text" 
+                                    class="w-full border border-gray-300 rounded p-2 mb-4 text-sm focus:ring-2 focus:ring-indigo-500" 
+                                    placeholder="Column Name"
+                                    .value="${this.newColName}"
+                                    @input="${e => this.newColName = e.target.value}"
+                                    @keydown="${e => e.key === 'Enter' && this.submitNewColumn()}"
+                                >
+                                <div class="flex justify-end space-x-2">
+                                    <button class="px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 hover:bg-gray-200 rounded" @click="${() => this.isAddingColumn = false}">Cancel</button>
+                                    <button class="px-3 py-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded" @click="${this.submitNewColumn}">Add</button>
+                                </div>
+                             </div>
+                        </div>
+                    ` : nothing}
+
+                    <div class="bg-gray-50 border-t border-gray-200 px-4 py-2 text-[10px] text-gray-500 flex space-x-4 z-50">
+                         <span><b>Enter</b> New Row</span>
+                         <span><b>Tab</b> Indent</span>
+                         <span><b>Shift+Tab</b> Outdent</span>
+                         <span><b>Cmd+Z</b> Undo</span>
+                    </div>
+                `;
+            }
+        }
+        customElements.define('lit-outliner', OutlinerApp);
+
+        render(html`<lit-outliner></lit-outliner>`, document.getElementById('app-root'));
+    </script>
+</body>
+</html>
