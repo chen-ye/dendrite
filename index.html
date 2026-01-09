@@ -86,7 +86,14 @@
         import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        const firebaseConfig = JSON.parse(__firebase_config);
+        const firebaseConfig = {
+          apiKey: "AIzaSyAMJpHWs_tWurx8UPzQxs_zKjlt9kp7rmg",
+          authDomain: "dendrite-834c9.firebaseapp.com",
+          projectId: "dendrite-834c9",
+          storageBucket: "dendrite-834c9.firebasestorage.app",
+          messagingSenderId: "389794446804",
+          appId: "1:389794446804:web:a64cabd8d317b075c42a41"
+        };
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
         const db = getFirestore(app);
